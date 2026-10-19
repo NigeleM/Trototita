@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trototita</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">TROTO<span>TITA</span></div>
+    <nav>
+      <button data-view="dashboard" class="active">Dashboard</button>
+      <button data-view="data">Data grid</button>
+      <button data-view="charts">Charts</button>
+      <button data-view="alerts">Alerts <span class="badge" id="alert-badge" hidden></span></button>
+      <button data-view="poam">POA&amp;M / RBD</button>
+      <button data-view="assets">Assets</button>
+      <button data-view="timeline">Timeline</button>
+      <button data-view="rules">Rules</button>
+      <button data-view="import">Import</button>
+      <button data-view="sql">SQL console</button>
+      <button data-view="settings">Settings</button>
+    </nav>
+  </aside>
+  <main id="main"></main>
+  <div id="toast" hidden></div>
+  <script src="app.js"></script>
+  <script src="workflow.js"></script>
+</body>
+</html>

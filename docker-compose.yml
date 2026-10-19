@@ -1,0 +1,26 @@
+# Team server. Put the certificate and key in ./deploy/certs (see server/make-cert.sh), then:
+#   docker compose up -d --build
+# Accounts are created with:
+#   docker compose run --rm -T vulnmgt-server add-user <name> <role> --db /data/team.db   (password on stdin)
+services:
+  vulnmgt-server:
+    build: .
+    image: vulnmgt-server:0.1.0
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./deploy/certs:/certs:ro
+      - vulnmgt-data:/data
+    environment:
+      - VULN_API_HOSTS=${VULN_API_HOSTS:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  vulnmgt-data:

@@ -1,0 +1,59 @@
+{
+  "name": "vulnmgt-app",
+  "version": "0.1.0",
+  "description": "Desktop vulnerability management: SQL, dashboard, grid filtering, rule-based prioritization and timeline",
+  "author": "Trototita",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "install:mac": "bash scripts/install-mac.sh"
+  },
+  "build": {
+    "appId": "com.vulnmgt.app",
+    "productName": "Trototita",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg"
+      ],
+      "identity": null
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility"
+    }
+  },
+  "devDependencies": {
+    "electron": "^44.9.0",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "xlsx": "file:vendor/xlsx-0.20.3.tgz"
+  },
+  "overrides": {
+    "@electron/get": "5.1.0",
+    "global-agent": "4.1.3",
+    "roarr": "7.21.7"
+  }
+}
