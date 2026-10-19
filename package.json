@@ -9,7 +9,7 @@
     "start": "electron .",
     "test": "node --test test/*.test.js",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder",
+    "dist": "electron-builder --publish never",
     "install:mac": "bash scripts/install-mac.sh"
   },
   "build": {
