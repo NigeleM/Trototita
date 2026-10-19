@@ -1,0 +1,100 @@
+# Tests the app, builds the installers for macOS, Windows and Linux, and publishes a GitHub release when a
+# version tag is pushed. Manual runs (workflow_dispatch) build and upload the installers without publishing.
+#
+#   Bump "version" in package.json, commit, then:
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# Installers are unsigned for now. Signing needs certificates (see TODO.md).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Tests
+        run: npm test
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            installer: "dist/*.dmg"
+          - os: windows-latest
+            installer: "dist/*.exe"
+          - os: ubuntu-latest
+            installer: "dist/*.AppImage"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build installer
+        run: npm run dist
+        env:
+          # Unsigned builds. Add signing secrets here once certificates are available.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trototita-${{ runner.os }}
+          path: ${{ matrix.installer }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Trototita $GITHUB_REF_NAME" \
+            --generate-notes
+
+  # Keep the newest 10 releases; older release pages are removed (their tags stay).
+  prune-releases:
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete releases past the newest 10
+        run: |
+          for tag in $(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[10:][].tagName'); do
+            echo "deleting release $tag (the tag stays)"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
