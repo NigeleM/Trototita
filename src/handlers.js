@@ -108,7 +108,8 @@ function safeFileName(name) {
   return (base || 'attachment').slice(0, 200);
 }
 
-function createHandlers(database, { allowedApiHosts = null, backupDir = null } = {}) {
+// teamMode: the team server offers no raw SQL console (it could bypass roles and the audit log).
+function createHandlers(database, { allowedApiHosts = null, backupDir = null, teamMode = false, backupKey = null } = {}) {
   const recompute = () => recomputeAll(database, todayIso());
 
   const handlers = {
@@ -320,12 +321,13 @@ function createHandlers(database, { allowedApiHosts = null, backupDir = null } =
     // Backups of the database file
     'backup:create': () => {
       if (!backupDir) throw new Error('Backups are not configured on this installation');
-      const { file, bytes } = createBackup(database, backupDir);
-      return { name: path.basename(file), bytes };
+      const { file, bytes, encrypted } = createBackup(database, backupDir, { key: backupKey });
+      return { name: path.basename(file), bytes, encrypted };
     },
     'backup:list': () => (backupDir ? listBackups(backupDir).map(({ name, bytes, created }) => ({ name, bytes, created })) : []),
   };
 
+  if (teamMode) delete handlers['db:sql'];
   return handlers;
 }
 

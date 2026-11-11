@@ -720,13 +720,16 @@ function ruleForm(columns) {
 
 // ---------- SQL console ----------
 
-function renderSql(root) {
+async function renderSql(root) {
   const editor = el('textarea', { spellcheck: 'false' }, 'SELECT title, cve, asset, priority_score, due_date\nFROM vulnerabilities\nORDER BY priority_score DESC\nLIMIT 20;');
   const output = el('div');
+  // The team server has no full-database console, so only the loaded-rows scope is offered there.
+  const { mode } = await window.api.authStatus();
+  const team = mode === 'team';
   // Loaded rows: a read-only copy of what the Data grid shows (same table, filters and sort). Full database: everything.
   const scope = el('select', {}, [
     ['loaded', 'Loaded rows (read-only)'],
-    ['full', 'Full database'],
+    ...(team ? [] : [['full', 'Full database']]),
   ].map(([v, label]) => el('option', { value: v }, label)));
 
   const run = async () => {
@@ -756,7 +759,9 @@ function renderSql(root) {
       el('button', { class: 'primary', onclick: run }, 'Run (⌘/Ctrl+Enter)'),
       scope,
       el('span', { class: 'muted' }, 'Tables: vulnerabilities, rules')),
-    el('p', { class: 'note' }, 'Loaded rows: the table name is the Data grid\'s table, and only SELECT works. Full database: writes run directly against the database, with no undo.'),
+    el('p', { class: 'note' }, team
+      ? 'Team server: queries run on loaded rows only (read-only). Accounts and the audit log are never available here.'
+      : 'Loaded rows: the table name is the Data grid\'s table, and only SELECT works. Full database: writes run directly against the database, with no undo.'),
     output
   );
 }

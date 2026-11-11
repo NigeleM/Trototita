@@ -1,5 +1,7 @@
 # Team server. Put the certificate and key in ./deploy/certs (see server/make-cert.sh), then:
 #   docker compose up -d --build
+# Optional: VULN_BACKUP_KEY (32 random bytes, base64) encrypts backups; keep it safe, backups cannot be
+# restored without it. VULN_TRUST_PROXY lists the address of a reverse proxy whose X-Forwarded-For is trusted.
 # Accounts are created with:
 #   docker compose run --rm -T vulnmgt-server add-user <name> <role> --db /data/team.db   (password on stdin)
 services:
@@ -10,9 +12,12 @@ services:
       - "8443:8443"
     volumes:
       - ./deploy/certs:/certs:ro
+      # For encryption at rest, replace the named volume with a folder on an encrypted disk, e.g. ./data:/data
       - vulnmgt-data:/data
     environment:
       - VULN_API_HOSTS=${VULN_API_HOSTS:-}
+      - VULN_BACKUP_KEY=${VULN_BACKUP_KEY:-}
+      - VULN_TRUST_PROXY=${VULN_TRUST_PROXY:-}
     read_only: true
     tmpfs:
       - /tmp

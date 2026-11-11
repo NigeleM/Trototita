@@ -2,6 +2,9 @@
 // and go through importRows(), which handles custom fields, date cleaning, optional cleaning steps,
 // the upsert, and the rule engine.
 const XLSX = require('xlsx');
+const dns = require('node:dns').promises;
+const http = require('node:http');
+const https = require('node:https');
 const { csvToObjects, parseCsv, normaliseHeader } = require('./csv');
 const { upsertVulnerabilities } = require('./db');
 const { recomputeAll } = require('./rules');
@@ -182,22 +185,75 @@ const MAX_API_BYTES = 25 * 1024 * 1024;
 
 // allowedHosts: null means any host (the desktop app, on the user's own machine). An array restricts
 // pulls to those host names; the team server passes one, so clients cannot make it reach internal hosts.
+// Cloud metadata services and link-local addresses are never valid API sources, and are a common SSRF target.
+function isMetadataHost(hostname) {
+  const h = String(hostname).toLowerCase().replace(/^\[|\]$/g, '');
+  return h === 'metadata.google.internal' || h === 'metadata'
+    || /^169\.254\./.test(h) || h.startsWith('fe80:') || h === 'fd00:ec2::254' || /^::ffff:169\.254\./.test(h);
+}
+
+// True for addresses that belong to cloud metadata services and link-local networks, whatever the name.
+function isBlockedAddress(address) {
+  const a = String(address).toLowerCase().replace(/^\[|\]$/g, '').replace(/^::ffff:/, '');
+  return /^169\.254\./.test(a) || a.startsWith('fe80:') || a === 'fd00:ec2::254';
+}
+
+// Connects only to addresses that pass the check, at the moment the connection is made. This closes the gap
+// between the earlier name check and the connection (a name could otherwise change its address in between).
+function checkedLookup(hostname, options, callback) {
+  dns.lookup(hostname, { all: true }).then((addresses) => {
+    if (addresses.some((r) => isBlockedAddress(r.address))) {
+      return callback(new Error('That address is not allowed for API imports'));
+    }
+    if (options && options.all) return callback(null, addresses);
+    return callback(null, addresses[0].address, addresses[0].family);
+  }, (err) => callback(err));
+}
+
+// GET that returns the body as text. Redirects are not followed, and the body size is capped.
+function getJson(url, headers) {
+  return new Promise((resolve, reject) => {
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.get(url, { headers, lookup: checkedLookup, timeout: 15000 }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400) {
+        res.resume();
+        return reject(new Error('API redirects are not followed'));
+      }
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        return reject(new Error(`API returned HTTP ${res.statusCode}`));
+      }
+      const chunks = [];
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > MAX_API_BYTES) {
+          req.destroy();
+          return reject(new Error('API response is too large'));
+        }
+        chunks.push(c);
+      });
+      res.on('end', () => { if (size <= MAX_API_BYTES) resolve(Buffer.concat(chunks).toString('utf8')); });
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('The API did not respond in time')));
+    req.on('error', reject);
+  });
+}
+
 async function importFromApi(db, config, { allowedHosts = null } = {}) {
   const url = new URL(config.url);
   if (!['https:', 'http:'].includes(url.protocol)) throw new Error('API URL must be http or https');
+  if (isMetadataHost(url.hostname)) throw new Error('That address is not allowed for API imports');
   if (allowedHosts && !allowedHosts.includes(url.hostname)) {
     throw new Error(`${url.hostname} is not an approved API host for this server`);
   }
+  // Check where the name points, not only its spelling: a public name can resolve to a blocked address.
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  const addresses = await dns.lookup(host, { all: true }).catch(() => { throw new Error(`Cannot resolve ${host}`); });
+  if (addresses.some((r) => isBlockedAddress(r.address))) throw new Error('That address is not allowed for API imports');
 
-  const response = await fetch(url, {
-    headers: { Accept: 'application/json', ...(config.headers || {}) },
-    signal: AbortSignal.timeout(15000),
-    redirect: 'error', // a redirect could point somewhere the host check did not approve
-  });
-  if (!response.ok) throw new Error(`API returned HTTP ${response.status}`);
-
-  const text = await response.text();
-  if (text.length > MAX_API_BYTES) throw new Error('API response is too large');
+  const text = await getJson(url, { Accept: 'application/json', ...(config.headers || {}) });
   const body = JSON.parse(text);
   const items = getPath(body, config.itemsPath);
   if (!Array.isArray(items)) throw new Error(`No array found at "${config.itemsPath || '(root)'}"`);
@@ -226,4 +282,4 @@ async function importFromApi(db, config, { allowedHosts = null } = {}) {
   return { fetched: items.length, written, skipped: items.length - rows.length, pruned, deduped };
 }
 
-module.exports = { importCsvText, importJsonText, importExcelBuffer, importFromApi, normaliseSeverity, normaliseStatus, getPath, SCANNER_PRESETS };
+module.exports = { isBlockedAddress, importCsvText, importJsonText, importExcelBuffer, importFromApi, normaliseSeverity, normaliseStatus, getPath, SCANNER_PRESETS };

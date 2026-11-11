@@ -23,9 +23,11 @@ const COLUMN_DEFS_SCHEMA = `
   );
 `;
 
+const { assertUserTable } = require('./protected');
+
 function assertIdentifier(name) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`Invalid table name: ${name}`);
-  return name;
+  return assertUserTable(name);
 }
 
 function physicalColumns(db, table) {

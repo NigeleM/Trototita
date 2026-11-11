@@ -186,7 +186,19 @@ function registerIpc() {
     fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
     return { filePath };
   });
-  ipcMain.handle('backup:restore', (_e, name) => restoreLocalBackup(name));
+  // Restoring replaces every record, so the user confirms in a native dialog. The page cannot skip it.
+  ipcMain.handle('backup:restore', (_e, name) => {
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'warning',
+      buttons: ['Cancel', 'Restore'],
+      defaultId: 0,
+      cancelId: 0,
+      message: 'Restore this backup?',
+      detail: 'The current database is kept as a copy next to the live file, but the app will switch to the backup now.',
+    });
+    if (choice !== 1) throw new Error('Restore cancelled');
+    return restoreLocalBackup(name);
+  });
 
   ipcMain.handle('import:file', async (_e, options = {}) => {
     const { filePaths, canceled } = await dialog.showOpenDialog({

@@ -118,6 +118,12 @@ node server/server.js restore --from backups/<file>   # stop the server first; t
 
 The server backs up once a day and refreshes the threat feeds once a day. The threat feeds (CISA and FIRST) need outbound HTTPS from the server.
 
+### Data at rest
+
+- **Team server: encrypted disk.** The database and its backups are plain SQLite files, so put the server's data on an encrypted volume. Use a bind mount to an encrypted disk instead of the default named volume in `docker-compose.yml`, for example `./data:/data` with `./data` on an encrypted disk (FileVault, BitLocker, LUKS or your storage platform's encryption). Keep `server/key.pem` and `VULN_BACKUP_KEY` on the same protected host, not in the data folder.
+- **Team server: encrypted backups.** Set `VULN_BACKUP_KEY` to 32 random bytes, base64 encoded (`openssl rand -base64 32`). Every backup is then encrypted with AES-256-GCM. Store the key separately from the backups: without it, encrypted backups cannot be restored.
+- **Desktop app: no database encryption.** The local database and its backups are owner-only files, protected by your computer's own disk encryption. Keep full-disk encryption turned on.
+
 ### 4. Connect the desktop app
 
 Open **Settings → Data storage and team sign-in**, choose **Team server**, enter the server address (for example `https://vulnmgt.internal:8443`), choose the certificate file, and sign in. Your personal settings stay on your computer. The data is on the server.
@@ -150,9 +156,11 @@ The same `src/handlers.js` code runs in the desktop app (local mode) and on the 
 - **Renderer:** sandboxed, with `contextIsolation` on and no Node access. The page cannot navigate away, open windows, or get browser permissions. The CSP allows only the app's own scripts and styles, and blocks objects, base-tag changes, form submission and framing.
 - **Imported text** is written with `textContent`, never `innerHTML`. JSON and Excel keys that could change an object's prototype are ignored.
 - **Exports** neutralise spreadsheet formulas (CSV injection): text starting with `= + - @` is prefixed with an apostrophe.
-- **SQL:** table and column names are validated before they reach SQL, and values are always bound as parameters. The SQL console is admin-only in team mode.
-- **Team server:** HTTPS only. Passwords use scrypt, must be 12 to 256 characters, and five failed sign-ins lock an account for 15 minutes. Roles are checked on every call. Every call and denial is audit-logged. Connections have timeouts, and request bodies are size-limited.
-- **API pulls on the server** are limited to hosts listed in `VULN_API_HOSTS`. Redirects are refused, so a pull cannot be sent somewhere that was not approved.
+- **SQL:** table and column names are validated before they reach SQL, and values are always bound as parameters. The team server has no SQL console. The desktop console runs only on that computer.
+- **Protected tables:** accounts, sessions and the audit log cannot be read or changed through the grid or the importers. The audit log is append-only, even for direct SQL.
+- **Team server:** HTTPS only. Passwords use scrypt and must be 12 to 256 characters. Sign-ins are limited per client address and account (five failures lock that pair for 15 minutes), and each account slows down after repeated failures. Roles are read from the account on every call, and a disabled account, a changed role or a changed password ends its sessions at once. Sessions end after an hour without use or eight hours in total. Every call and denial is audit-logged. Connections have timeouts, and request bodies are size-limited.
+- **Team server behind a proxy:** set `VULN_TRUST_PROXY` to the proxy's address so sign-in limits apply to real clients.
+- **API pulls on the server** are limited to hosts listed in `VULN_API_HOSTS`. Redirects are refused, and each connection is checked so a pull cannot reach cloud metadata or link-local addresses.
 - **Sessions and tokens** live in memory only. Nothing sensitive is written to the settings file.
 - **Dependencies:** `npm audit` reports 0 vulnerabilities. Some build-tool packages are pinned with npm `overrides` until electron-builder updates them.
 
@@ -166,6 +174,7 @@ VULN_API_HOSTS=scanner.internal.example node server/server.js serve --cert serve
 
 - Single-machine team server, no high availability. Sessions are in memory, so a restart signs everyone out.
 - Accounts are managed from the server command line. There is no admin screen yet.
-- Login throttling is per account name, so it does not stop someone spreading guesses across many accounts. Put the server behind your network's controls.
+- Sign-in limits are per client address and account, and accounts slow down after repeated failures. A patient attacker using many addresses can still make guesses, so keep the server behind your network's controls and require long passphrases.
+- The live database is not encrypted by the app. Use an encrypted disk (see Data at rest).
 - Control mapping checks a list of control IDs on each finding. It does not load a control catalogue.
 - The grid loads up to 2,000 rows at a time.

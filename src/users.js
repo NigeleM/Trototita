@@ -9,6 +9,7 @@ const MAX_PASSWORD = 256; // long enough for passphrases; caps the cost of hashi
 const MAX_TRACKED = 10000; // bounds the session and failed-login maps
 const SCRYPT = { N: 16384, r: 8, p: 1 };
 const SESSION_MS = 8 * 60 * 60 * 1000;
+const SESSION_IDLE_MS = 60 * 60 * 1000;
 
 const USERS_SCHEMA = `
   CREATE TABLE IF NOT EXISTS users (
@@ -29,8 +30,29 @@ const USERS_SCHEMA = `
   );
 `;
 
+// The audit log is append-only: entries can be added and read, never changed or removed.
+const AUDIT_TRIGGERS = `
+  CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+  BEGIN SELECT RAISE(ABORT, 'The audit log is append-only'); END;
+  CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+  BEGIN SELECT RAISE(ABORT, 'The audit log is append-only'); END;
+`;
+
 function initUsers(db) {
   db.exec(USERS_SCHEMA);
+  db.exec(AUDIT_TRIGGERS);
+}
+
+// Changes whenever the password hash changes, so a session issued before a password change stops working.
+function fingerprintOf(passwordHash) {
+  return crypto.createHash('sha256').update(String(passwordHash)).digest('hex');
+}
+
+// The account as it is now, or null if it does not exist or is disabled. Sessions are checked against this.
+function findActive(db, username) {
+  const row = db.prepare('SELECT username, role, password_hash, disabled FROM users WHERE username = ?').get(String(username));
+  if (!row || row.disabled) return null;
+  return { username: row.username, role: row.role, fingerprint: fingerprintOf(row.password_hash) };
 }
 
 function hashPassword(password) {
@@ -95,10 +117,14 @@ function authenticate(db, username, password) {
     hashPassword(secret || 'x'.repeat(MIN_PASSWORD));
     return null;
   }
-  return verifyPassword(secret, row.password_hash) ? { username: row.username, role: row.role } : null;
+  return verifyPassword(secret, row.password_hash)
+    ? { username: row.username, role: row.role, fingerprint: fingerprintOf(row.password_hash) }
+    : null;
 }
 
-// In-memory sessions. A server restart signs everyone out, which is acceptable at this scale.
+// Sessions. A session stores who signed in and a fingerprint of the password hash it was issued under.
+// The server re-reads the account on every request (findActive), so a disabled account, a changed role or a
+// changed password ends the session at once. Sessions also end after 8 hours, or 1 hour without use.
 class Sessions {
   constructor(now = () => Date.now()) {
     this.now = now;
@@ -108,19 +134,32 @@ class Sessions {
   create(user) {
     const token = crypto.randomBytes(32).toString('base64url');
     if (this.map.size >= MAX_TRACKED) this.prune();
-    this.map.set(token, { ...user, expires: this.now() + SESSION_MS });
+    const t = this.now();
+    this.map.set(token, {
+      username: user.username,
+      fingerprint: user.fingerprint,
+      issued: t,
+      lastSeen: t,
+    });
     return token;
   }
 
-  prune() {
-    const now = this.now();
-    for (const [token, s] of this.map) if (s.expires < now) this.map.delete(token);
+  expired(s, t) {
+    return t - s.issued > SESSION_MS || t - s.lastSeen > SESSION_IDLE_MS;
   }
 
+  prune() {
+    const t = this.now();
+    for (const [token, s] of this.map) if (this.expired(s, t)) this.map.delete(token);
+  }
+
+  // Returns the stored session, or null. Each use refreshes the idle timer.
   get(token) {
     const s = this.map.get(token);
     if (!s) return null;
-    if (s.expires < this.now()) { this.map.delete(token); return null; }
+    const t = this.now();
+    if (this.expired(s, t)) { this.map.delete(token); return null; }
+    s.lastSeen = t;
     return s;
   }
 
@@ -129,32 +168,36 @@ class Sessions {
   }
 }
 
-// Failed sign-ins per username; blocks further attempts for 15 minutes after 5 failures.
+// Failed sign-ins are counted per key (the server uses "ip|username" and "ip" keys). Once `limit` failures
+// land inside the window, the key is blocked until the window ends.
 class LoginThrottle {
-  constructor(now = () => Date.now()) {
+  constructor({ limit = 5, windowMs = 15 * 60 * 1000, now = () => Date.now() } = {}) {
+    this.limit = limit;
+    this.windowMs = windowMs;
     this.now = now;
     this.failures = new Map();
   }
 
-  blocked(username) {
-    const f = this.failures.get(username);
+  blocked(key) {
+    const f = this.failures.get(key);
     if (!f) return false;
-    if (this.now() - f.first > 15 * 60 * 1000) { this.failures.delete(username); return false; }
-    return f.count >= 5;
+    if (this.now() - f.first > this.windowMs) { this.failures.delete(key); return false; }
+    return f.count >= this.limit;
   }
 
-  fail(username) {
-    if (this.failures.size >= MAX_TRACKED) this.failures.clear(); // bound memory under a flood of unknown names
-    const f = this.failures.get(username);
-    if (!f || this.now() - f.first > 15 * 60 * 1000) {
-      this.failures.set(username, { count: 1, first: this.now() });
-    } else {
-      f.count += 1;
+  fail(key) {
+    const t = this.now();
+    let f = this.failures.get(key);
+    if (!f || t - f.first > this.windowMs) {
+      if (!f && this.failures.size >= MAX_TRACKED) this.failures.delete(this.failures.keys().next().value); // drop the oldest key
+      f = { count: 0, first: t };
+      this.failures.set(key, f);
     }
+    f.count += 1;
   }
 
-  succeed(username) {
-    this.failures.delete(username);
+  succeed(key) {
+    this.failures.delete(key);
   }
 }
 
@@ -178,6 +221,8 @@ module.exports = {
   setDisabled,
   setPassword,
   authenticate,
+  findActive,
+  fingerprintOf,
   Sessions,
   LoginThrottle,
   logAudit,

@@ -97,8 +97,9 @@ test('viewer can read but cannot edit or run SQL', async () => {
 
   const edit = await rawRequest('/api/call', { channel: 'db:updateCell', args: { table: 'vulnerabilities', rowid: 1, column: 'status', value: 'closed' } }, token);
   assert.equal(edit.status, 403);
+  // The team server has no SQL console at all.
   const sql = await rawRequest('/api/call', { channel: 'db:sql', args: 'DELETE FROM vulnerabilities' }, token);
-  assert.equal(sql.status, 403);
+  assert.equal(sql.status, 404);
 });
 
 test('editor can add a comment but cannot change rules', async () => {
@@ -111,10 +112,10 @@ test('editor can add a comment but cannot change rules', async () => {
   assert.equal(rule.status, 403);
 });
 
-test('admin can run SQL; unknown channels return 404', async () => {
+test('the team server has no SQL console, even for admins; unknown channels return 404', async () => {
   const token = await signIn('ada');
   const sql = await rawRequest('/api/call', { channel: 'db:sql', args: 'SELECT COUNT(*) AS n FROM vulnerabilities' }, token);
-  assert.equal(sql.status, 200);
+  assert.equal(sql.status, 404);
   const unknown = await rawRequest('/api/call', { channel: 'nope:nothing', args: null }, token);
   assert.equal(unknown.status, 404);
 });
@@ -135,10 +136,10 @@ test('handler errors come back as 400 with the message', async () => {
 
 test('every call and denial is written to the audit log', async () => {
   const token = await signIn('vera');
-  await rawRequest('/api/call', { channel: 'db:sql', args: 'SELECT 1' }, token);
+  await rawRequest('/api/call', { channel: 'users:list', args: null }, token);
   await rawRequest('/api/call', { channel: 'db:tables', args: null }, token);
   const entries = users.listAudit(auditDb, 500);
-  assert.ok(entries.some((e) => e.username === 'vera' && e.channel === 'db:sql' && e.outcome === 'denied'));
+  assert.ok(entries.some((e) => e.username === 'vera' && e.channel === 'users:list' && e.outcome === 'denied'));
   assert.ok(entries.some((e) => e.username === 'vera' && e.channel === 'db:tables' && e.outcome === 'ok'));
   assert.ok(entries.some((e) => e.channel === 'login' && e.outcome === 'failed'));
 });

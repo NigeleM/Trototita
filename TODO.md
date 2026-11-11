@@ -8,7 +8,7 @@ Backups and restore, KEV and EPSS, RBD review reminders, remediation metrics, sc
 ## Still to build (in rough priority order)
 - [ ] Scheduled API pulls. Decide how API tokens are stored first (they are not stored today).
 - [ ] Two-factor sign-in (TOTP) for team accounts.
-- [ ] Encryption of the database at rest (encrypted SQLite build or encrypted volume).
+- [x] Encryption at rest, decided: the team server runs on an encrypted disk (README, Data at rest), backups are encrypted with VULN_BACKUP_KEY, and the desktop app relies on full-disk encryption.
 - [ ] PDF summary export (needs a PDF library).
 - [ ] Command palette and full keyboard navigation.
 - [ ] Weekly summary email (needs your decision on email).

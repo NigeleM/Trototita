@@ -14,6 +14,7 @@ const { recomputeAll } = require('../src/rules');
 const { refreshIntel } = require('../src/intel');
 const { createBackup, listBackups, restoreBackup } = require('../src/backup');
 const users = require('../src/users');
+const { parseBackupKey } = require('../src/backup');
 
 const MAX_BODY = 30 * 1024 * 1024; // Excel uploads arrive base64 encoded
 const SNAPSHOT_MS = 30 * 60 * 1000;
@@ -46,6 +47,36 @@ function readJson(req, limit = MAX_BODY) {
     });
     req.on('error', reject);
   });
+}
+
+// The address a sign-in is counted against. Behind a reverse proxy that is listed in trustedProxies, the real
+// client is the last address the proxy added to X-Forwarded-For.
+function normaliseAddress(address) {
+  return String(address || 'unknown').replace(/^::ffff:/, '');
+}
+
+function clientAddress(req, trustedProxies = []) {
+  const remote = normaliseAddress(req.socket.remoteAddress);
+  const forwarded = req.headers['x-forwarded-for'];
+  if (trustedProxies.includes(remote) && typeof forwarded === 'string' && forwarded.trim()) {
+    return normaliseAddress(forwarded.split(',').pop().trim());
+  }
+  return remote;
+}
+
+// Progressive delay for an account after repeated failures: the first two are free, then each waits longer
+// (500 ms, 1 s, 2 s, capped at 4 s). Slows guessing from many addresses without locking anyone out.
+function accountDelayMs(failures) {
+  if (failures < 3) return 0;
+  return Math.min(4000, 500 * 2 ** (failures - 3));
+}
+
+// Channels that record a person's name: the value is the signed-in account, whatever the client sent.
+const CALLER_FIELDS = { 'finding:comment': 'author', 'attachments:add': 'uploadedBy' };
+
+// Errors raised by SQLite itself (node:sqlite sets a code such as ERR_SQLITE_ERROR).
+function isDatabaseError(err) {
+  return typeof err.code === 'string' && err.code.startsWith('ERR_SQLITE');
 }
 
 function bearer(req) {
@@ -89,9 +120,11 @@ function adminChannels(database) {
 
 // allowedApiHosts: hosts the API importer may pull from. Empty by default, so nothing is pulled until you approve hosts.
 // backupDir: where daily backups are written. Defaults to a "backups" folder next to the database file.
-function createServer({ database, cert, key, allowedApiHosts = [], backupDir = null, sessions = new users.Sessions(), throttle = new users.LoginThrottle() }) {
+function createServer({ database, cert, key, allowedApiHosts = [], backupDir = null, backupKey = null, trustedProxies = [], sessions = new users.Sessions(), throttle = new users.LoginThrottle({ limit: 5 }), ipThrottle = new users.LoginThrottle({ limit: 50 }) }) {
   users.initUsers(database);
-  const handlers = createHandlers(database, { allowedApiHosts, backupDir });
+  // The team server has no raw SQL console: it could bypass roles and the audit log. Admins use the command line.
+  const handlers = createHandlers(database, { allowedApiHosts, backupDir, teamMode: true, backupKey });
+  const accountFails = new Map(); // account name -> { count, last }; drives the progressive delay below
   const admin = adminChannels(database);
 
   const handle = async (req, res) => {
@@ -105,24 +138,44 @@ function createServer({ database, cert, key, allowedApiHosts = [], backupDir = n
       const body = await readJson(req, 16 * 1024);
       const username = typeof body.username === 'string' ? body.username.slice(0, 64) : '';
       const password = typeof body.password === 'string' ? body.password : '';
-      if (throttle.blocked(username)) {
+      // Failures count per client address and per account from that address. One attacker cannot lock a
+      // user out from elsewhere, and a single address cannot try many passwords across all accounts.
+      const ip = clientAddress(req, trustedProxies);
+      const pairKey = `${ip}|${username}`;
+      if (ipThrottle.blocked(ip) || throttle.blocked(pairKey)) {
         users.logAudit(database, username, 'login', 'throttled');
         return send(res, 429, { ok: false, error: 'Too many failed attempts. Try again in 15 minutes.' });
       }
+      // Each account also slows down after repeated failures, from any address. Nobody is locked out.
+      const account = username.toLowerCase();
+      const prior = accountFails.get(account);
+      const recent = prior && Date.now() - prior.last < 15 * 60 * 1000;
+      const wait = accountDelayMs(recent ? prior.count : 0);
+      if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
       const user = users.authenticate(database, username, password);
       if (!user) {
-        throttle.fail(username);
+        if (accountFails.size >= 10000) accountFails.delete(accountFails.keys().next().value);
+        accountFails.set(account, { count: (recent ? prior.count : 0) + 1, last: Date.now() });
+        throttle.fail(pairKey);
+        ipThrottle.fail(ip);
         users.logAudit(database, username, 'login', 'failed');
         return send(res, 401, { ok: false, error: 'Invalid username or password' });
       }
-      throttle.succeed(username);
+      throttle.succeed(pairKey);
+      accountFails.delete(account);
       users.logAudit(database, user.username, 'login', 'ok');
       return send(res, 200, { ok: true, token: sessions.create(user), username: user.username, role: user.role });
     }
 
     const token = bearer(req);
-    const session = token ? sessions.get(token) : null;
-    if (!session) return send(res, 401, { ok: false, error: 'Sign in required' });
+    const stored = token ? sessions.get(token) : null;
+    // Check the account as it is now: a disabled account, a changed password or a removed account ends the session.
+    const current = stored ? users.findActive(database, stored.username) : null;
+    if (!stored || !current || current.fingerprint !== stored.fingerprint) {
+      if (token) sessions.revoke(token);
+      return send(res, 401, { ok: false, error: 'Sign in required' });
+    }
+    const session = { username: current.username, role: current.role }; // role comes from the account, not the sign-in
 
     if (req.method === 'POST' && url.pathname === '/api/logout') {
       sessions.revoke(token);
@@ -130,11 +183,15 @@ function createServer({ database, cert, key, allowedApiHosts = [], backupDir = n
     }
 
     if (req.method === 'POST' && url.pathname === '/api/call') {
-      const { channel, args } = await readJson(req);
+      const { channel, args: rawArgs } = await readJson(req);
       const isAdminChannel = Object.prototype.hasOwnProperty.call(admin, channel);
       const handler = isAdminChannel ? admin[channel] : (Object.prototype.hasOwnProperty.call(handlers, channel) ? handlers[channel] : null);
       if (!handler) return send(res, 404, { ok: false, error: `Unknown channel: ${channel}` });
       const permitted = isAdminChannel ? session.role === 'admin' : allowed(session.role, channel);
+      // Fields that record who did something are filled in from the signed-in account, never from the request.
+      const args = CALLER_FIELDS[channel] && rawArgs && typeof rawArgs === 'object'
+        ? { ...rawArgs, [CALLER_FIELDS[channel]]: session.username }
+        : rawArgs;
       if (!permitted) {
         users.logAudit(database, session.username, channel, 'denied');
         return send(res, 403, { ok: false, error: `Your role (${session.role}) cannot use this action` });
@@ -145,6 +202,11 @@ function createServer({ database, cert, key, allowedApiHosts = [], backupDir = n
         return send(res, 200, { ok: true, result });
       } catch (err) {
         users.logAudit(database, session.username, channel, 'error');
+        // Database errors can reveal table and column names, so only the app's own messages reach the client.
+        if (isDatabaseError(err)) {
+          console.error(`${channel}: ${err.message}`);
+          return send(res, 400, { ok: false, error: 'The request could not be completed' });
+        }
         return send(res, 400, { ok: false, error: err.message });
       }
     }
@@ -153,7 +215,11 @@ function createServer({ database, cert, key, allowedApiHosts = [], backupDir = n
   };
 
   const server = https.createServer({ cert, key }, (req, res) => {
-    handle(req, res).catch((err) => send(res, err.status || 500, { ok: false, error: err.message }));
+    handle(req, res).catch((err) => {
+      if (err.status && err.status < 500) return send(res, err.status, { ok: false, error: err.message });
+      console.error(err);
+      return send(res, 500, { ok: false, error: 'The server could not complete the request' });
+    });
   });
   // Limits on slow or stalled connections.
   server.headersTimeout = 20 * 1000;
@@ -173,7 +239,7 @@ function createServer({ database, cert, key, allowedApiHosts = [], backupDir = n
   // Once a day: a verified backup, and a refresh of the threat-intelligence feeds (needs outbound HTTPS).
   const daily = setInterval(async () => {
     if (backupDir) {
-      try { createBackup(database, backupDir); } catch (err) { console.error('Backup failed:', err.message); }
+      try { createBackup(database, backupDir, { key: backupKey }); } catch (err) { console.error('Backup failed:', err.message); }
     }
     try {
       await refreshIntel(database, { today: new Date().toISOString().slice(0, 10) });
@@ -209,6 +275,7 @@ function readPasswordFromStdin() {
 async function main(argv) {
   const [command, ...rest] = argv;
   const dbFile = argValue(rest, 'db', path.join(__dirname, 'team.db'));
+  process.umask(0o077); // files this process creates (database, backups, journal) are owner-only
   const database = openDatabase(dbFile);
   users.initUsers(database);
 
@@ -219,7 +286,9 @@ async function main(argv) {
     const host = argValue(rest, 'host', '0.0.0.0');
     const allowedApiHosts = (process.env.VULN_API_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean);
     const backupDir = path.join(path.dirname(dbFile), 'backups');
-    const server = createServer({ database, cert, key, allowedApiHosts, backupDir });
+    const backupKey = parseBackupKey(process.env.VULN_BACKUP_KEY);
+    const trustedProxies = (process.env.VULN_TRUST_PROXY || '').split(',').map((a) => a.trim()).filter(Boolean);
+    const server = createServer({ database, cert, key, allowedApiHosts, backupDir, backupKey, trustedProxies });
     server.listen(port, host, () => console.log(`Trototita team server listening on https://${host}:${port}`));
     const shutdown = () => { server.close(); database.close(); process.exit(0); };
     process.on('SIGINT', shutdown);
@@ -246,8 +315,8 @@ async function main(argv) {
   } else if (command === 'audit') {
     console.table(users.listAudit(database, Number(positional[0]) || 50));
   } else if (command === 'backup') {
-    const { file, bytes } = createBackup(database, path.join(path.dirname(dbFile), 'backups'));
-    console.log(`Backup written: ${file} (${bytes} bytes)`);
+    const { file, bytes, encrypted } = createBackup(database, path.join(path.dirname(dbFile), 'backups'), { key: parseBackupKey(process.env.VULN_BACKUP_KEY) });
+    console.log(`Backup written: ${file} (${bytes} bytes${encrypted ? ', encrypted' : ''})`);
   } else if (command === 'backups') {
     console.table(listBackups(path.join(path.dirname(dbFile), 'backups')).map(({ name, bytes, created }) => ({ name, bytes, created })));
   } else if (command === 'restore') {
@@ -255,7 +324,7 @@ async function main(argv) {
     const from = argValue(rest, 'from', null);
     if (!from) throw new Error('Give the backup file with --from <file>');
     database.close();
-    const res = restoreBackup(dbFile, from);
+    const res = restoreBackup(dbFile, from, { key: parseBackupKey(process.env.VULN_BACKUP_KEY) });
     console.log(`Restored ${from}. The previous database was kept at ${res.safetyCopy}`);
     return;
   } else {
@@ -271,4 +340,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer };
+module.exports = { createServer, clientAddress, accountDelayMs };

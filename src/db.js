@@ -3,6 +3,8 @@
 const { DatabaseSync } = require('node:sqlite');
 const { COLUMN_DEFS_SCHEMA } = require('./columns');
 const { migrate } = require('./migrations');
+const { isProtectedTable, assertUserTable } = require('./protected');
+const fs = require('node:fs');
 
 const SEVERITIES = ['Critical', 'High', 'Medium', 'Low', 'Info'];
 
@@ -40,9 +42,17 @@ const SCHEMA = `
   );
 `;
 
+// Owner-only permissions on the database and its journal files (other local users must not read the data).
+function restrictFiles(file) {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { fs.chmodSync(file + suffix, 0o600); } catch { /* file not created yet */ }
+  }
+}
+
 function openDatabase(file) {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  if (file !== ':memory:') restrictFiles(file);
   db.exec(SCHEMA);
   db.exec(COLUMN_DEFS_SCHEMA);
   migrate(db);
@@ -57,13 +67,14 @@ function assertIdentifier(name) {
 
 function listTables(db) {
   return db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'column_defs' ORDER BY name")
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
     .all()
-    .map((r) => r.name);
+    .map((r) => r.name)
+    .filter((name) => !isProtectedTable(name));
 }
 
 function listColumns(db, table) {
-  return db.prepare(`PRAGMA table_info(${assertIdentifier(table)})`).all().map((c) => c.name);
+  return db.prepare(`PRAGMA table_info(${assertUserTable(assertIdentifier(table))})`).all().map((c) => c.name);
 }
 
 // Runs any SQL the user typed in the SQL console.
@@ -154,7 +165,7 @@ function updateCell(db, table, rowid, column, value) {
 
 // Adds a blank row from the grid. Vulnerabilities need a title and a first-seen date; other tables use their defaults.
 function insertRow(db, table, today = new Date().toISOString().slice(0, 10)) {
-  assertIdentifier(table);
+  assertUserTable(assertIdentifier(table));
   const result = table === 'vulnerabilities'
     ? db.prepare('INSERT INTO vulnerabilities (title, first_seen) VALUES (?, ?)').run('New finding', today)
     : db.prepare(`INSERT INTO ${table} DEFAULT VALUES`).run();
@@ -162,7 +173,7 @@ function insertRow(db, table, today = new Date().toISOString().slice(0, 10)) {
 }
 
 function deleteRows(db, table, rowids) {
-  assertIdentifier(table);
+  assertUserTable(assertIdentifier(table));
   const stmt = db.prepare(`DELETE FROM ${table} WHERE rowid = ?`);
   let deleted = 0;
   db.exec('BEGIN');
